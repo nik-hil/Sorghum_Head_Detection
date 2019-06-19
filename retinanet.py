@@ -325,25 +325,58 @@ class SigmaL1SmoothLoss(nn.Module):
         reg_loss = torch.where(torch.le(reg_diff, 1/9), 4.5 * torch.pow(reg_diff, 2), reg_diff - 1/18)
         return reg_loss.mean()
 
-ratios = [1/2,1,2]
-scales = [1,2**(-1/3), 2**(-2/3)]
-#scales = [1,2**(1/3), 2**(2/3)] for bigger size
 
-encoder = create_body(models.resnet50, cut=-2)
-model = RetinaNet(encoder, data.c, final_bias=-4)
-crit = RetinaNetFocalLoss(scales=scales, ratios=ratios)
-learn = Learner(data, model, loss_func=crit)
-
-torch.sigmoid(tensor([-4.]))
 
 def retina_net_split(model):
     groups = [list(model.encoder.children())[:6], list(model.encoder.children())[6:]]
     return groups + [list(model.children())[1:]]
 
-"""# Start Learning"""
+# Retinanet & focal loass specific
 
-#learn = learn.split(retina_net_split)
+def unpad(tgt_bbox, tgt_clas, pad_idx=0):
+    i = torch.min(torch.nonzero(tgt_clas-pad_idx))
+    return tlbr2cthw(tgt_bbox[i:]), tgt_clas[i:]-1+pad_idx
 
+def process_output(output, i, detect_thresh=0.25):
+    "Process `output[i]` and return the predicted bboxes above `detect_thresh`."
+    clas_pred,bbox_pred,sizes = output[0][i], output[1][i], output[2]
+    anchors = create_anchors(sizes, ratios, scales).to(clas_pred.device)
+    bbox_pred = activ_to_bbox(bbox_pred, anchors)
+    clas_pred = torch.sigmoid(clas_pred)
+    detect_mask = clas_pred.max(1)[0] > detect_thresh
+    bbox_pred, clas_pred = bbox_pred[detect_mask], clas_pred[detect_mask]
+    bbox_pred = tlbr2cthw(torch.clamp(cthw2tlbr(bbox_pred), min=-1, max=1))    
+    scores, preds = clas_pred.max(1)
+    return bbox_pred, scores, preds
+
+def _draw_outline(o:Patch, lw:int):
+    "Outline bounding box onto image `Patch`."
+    o.set_path_effects([patheffects.Stroke(
+        linewidth=lw, foreground='black'), patheffects.Normal()])
+
+def draw_rect(ax:plt.Axes, b:Collection[int], color:str='white', text=None, text_size=14):
+    "Draw bounding box on `ax`."
+    patch = ax.add_patch(patches.Rectangle(b[:2], *b[-2:], fill=False, edgecolor=color, lw=2))
+    _draw_outline(patch, 4)
+    if text is not None:
+        patch = ax.text(*b[:2], text, verticalalignment='top', color=color, fontsize=text_size, weight='bold')
+        _draw_outline(patch,1)
+        
+def show_preds(img, output, idx, detect_thresh=0.25, classes=None):
+    bbox_pred, scores, preds = process_output(output, idx, detect_thresh)
+    bbox_pred, preds, scores = bbox_pred.cpu(), preds.cpu(), scores.cpu()
+    t_sz = torch.Tensor([*img.size])[None].float()
+    bbox_pred[:,:2] = bbox_pred[:,:2] - bbox_pred[:,2:]/2
+    bbox_pred[:,:2] = (bbox_pred[:,:2] + 1) * t_sz/2
+    bbox_pred[:,2:] = bbox_pred[:,2:] * t_sz
+    bbox_pred = bbox_pred.long()
+    _, ax = plt.subplots(1,1)
+    for bbox, c, scr in zip(bbox_pred, preds, scores):
+        img.show(ax=ax)
+        txt = str(c.item()) if classes is None else classes[c.item()+1]
+        draw_rect(ax, [bbox[1],bbox[0],bbox[3],bbox[2]], text=f'{txt} {scr:.2f}')
+        
+        
 def nms(boxes, scores, thresh=0.3):
     idx_sort = scores.argsort(descending=True)
     boxes, scores = boxes[idx_sort], scores[idx_sort]
@@ -418,7 +451,7 @@ def get_test_data(bs, size):
 # learn.data = get_test_data(24,256)  
 # learn.data.single_ds.tfmargs['size'] = None
 
-def show_test_results(learn, oimg=img, start=0, n=1, detect_thresh=0.35, nms_thresh=0.3, figsize=(10,25), classes=learn.data.classes):
+def show_test_results(learn, oimg, classes, start=0, n=1, detect_thresh=0.35, nms_thresh=0.3, figsize=(10,25)):
 #     import pdb; pdb.set_trace()
 #     x,y = learn.data.one_batch(DatasetType.Valid, cpu=False)
     x = learn.data.one_item(oimg)[0]
